@@ -1,0 +1,135 @@
+name: .NET CI
+
+on:
+  push:
+    branches: [ main, develop, feature/* ]
+  pull_request:
+    branches: [ main, develop ]
+
+env:
+  REGISTRY_NAME: cloudaccelerator.azurecr.io # Set your ACR registry name
+  IMAGE_NAME: myapp_dotnet
+  CLUSTER_NAME: trv-dev-aks
+  RESOURCEGROUP: trv-dev-app-rg
+  AKS_NAMESPACE: default
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      # required for all workflows
+      security-events: write
+
+      # only required for workflows in private repositories
+      actions: read
+      contents: read
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v1
+      with:
+        dotnet-version: '5.0.x'
+      
+    # Linting with dotnet-format
+    - name: Install dotnet-format
+      run: dotnet tool install --global dotnet-format
+      
+    - name: Run dotnet-format
+      run: dotnet-format --check src/MyApp/MyApp.csproj
+
+    # Analyze code using CodeQL  
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v2
+      with:
+        languages: csharp
+        queries: +security-and-quality  # Include both security and quality analysis
+        
+    - name: Build
+      run: |
+        dotnet build src/MyApp/MyApp.csproj
+        
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v2
+
+  build:
+    name: build
+    needs: test
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+      
+    - name: Setup .NET
+      uses: actions/setup-dotnet@v1
+      with:
+        dotnet-version: '5.0.x'
+    - name: Restore dependencies
+      run: dotnet restore src/MyApp/MyApp.csproj
+      
+    - name: Build
+      run: dotnet build src/MyApp/MyApp.csproj --configuration Release
+
+    - name: Publish
+      run: dotnet publish src/MyApp/MyApp.csproj --configuration Release --no-build --output publish
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v2
+      with:
+        name: myapp-artifacts
+        path: publish/
+
+  docker-build-and-push:
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: 'Login via Azure CLI'
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: 'Build and push image'
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ env.REGISTRY_NAME }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+      - run: |
+          docker build . -t ${{ env.REGISTRY_NAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ env.REGISTRY_NAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+
+  Deploy:
+    runs-on: ubuntu-latest
+    needs: [build, docker-build-and-push]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up kubectl
+        uses: azure/aks-set-context@v1
+        with:
+          creds: '${{ secrets.AZURE_CREDENTIALS }}'
+          cluster-name: ${{ env.CLUSTER_NAME }} # Replace with your AKS cluster name
+          resource-group: ${{ env.RESOURCEGROUP }} # Replace with your resource group
+        
+      - uses: Azure/k8s-create-secret@v1
+        with:
+          container-registry-url: ${{ env.REGISTRY_NAME }}
+          container-registry-username: ${{ secrets.ACR_USERNAME }}
+          container-registry-password: ${{ secrets.ACR_PASSWORD }}
+          secret-name: k8s-secret
+
+      - uses: Azure/k8s-deploy@v1
+        with:
+          manifests: |
+            manifests/deployment.yml
+            manifests/service.yml
+          images: |
+            ${{ env.REGISTRY_NAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          imagepullsecrets: |
+            k8s-secret
